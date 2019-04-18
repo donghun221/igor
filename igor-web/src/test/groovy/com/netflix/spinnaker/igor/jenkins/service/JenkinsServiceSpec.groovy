@@ -16,10 +16,12 @@
 
 package com.netflix.spinnaker.igor.jenkins.service
 
+import com.netflix.spinnaker.fiat.model.resources.Permissions
 import com.netflix.spinnaker.igor.build.model.GenericGitRevision
 import com.netflix.spinnaker.igor.config.JenkinsConfig
 import com.netflix.spinnaker.igor.config.JenkinsProperties
 import com.netflix.spinnaker.igor.jenkins.client.JenkinsClient
+import com.netflix.spinnaker.igor.jenkins.client.model.BuildsList
 import com.netflix.spinnaker.igor.jenkins.client.model.Project
 import com.squareup.okhttp.mockwebserver.MockResponse
 import com.squareup.okhttp.mockwebserver.MockWebServer
@@ -29,6 +31,9 @@ import spock.lang.Unroll
 
 @SuppressWarnings(['LineLength', 'DuplicateNumberLiteral'])
 class JenkinsServiceSpec extends Specification {
+    static {
+        System.setProperty("hystrix.command.default.execution.isolation.thread.timeoutInMilliseconds", "30000")
+    }
 
     final String JOB_UNENCODED = 'folder/job/name with spaces'
     final String JOB_ENCODED = 'folder/job/name%20with%20spaces'
@@ -42,24 +47,19 @@ class JenkinsServiceSpec extends Specification {
     @Shared
     JenkinsService csrfService
 
-    @Shared
-    MockWebServer server
-
     void setup() {
-        server = new MockWebServer()
-        server.enqueue(
-            new MockResponse()
-                .setBody(getProjects())
-                .setHeader('Content-Type', 'text/xml;charset=UTF-8')
-        )
-        server.start()
         client = Mock(JenkinsClient)
-        service = new JenkinsService('http://my.jenkins.net', client, false)
-        csrfService = new JenkinsService('http://my.jenkins.net', client, true)
+        service = new JenkinsService('http://my.jenkins.net', client, false, Permissions.EMPTY)
+        csrfService = new JenkinsService('http://my.jenkins.net', client, true, Permissions.EMPTY)
     }
 
-    void cleanup() {
-        server.shutdown()
+    @Unroll
+    void 'the "getBuilds method encodes the job name'() {
+        when:
+        service.getBuilds(JOB_UNENCODED)
+
+        then:
+        1 * client.getBuilds(JOB_ENCODED) >> new BuildsList(list: [])
     }
 
     @Unroll
@@ -80,7 +80,6 @@ class JenkinsServiceSpec extends Specification {
 
         where:
         method                | extra_args
-        'getBuilds'           | []
         'getDependencies'     | []
         'getBuild'            | [2]
         'getGitDetails'       | [2]
@@ -141,14 +140,51 @@ class JenkinsServiceSpec extends Specification {
         'stopQueuedBuild'     | []
     }
 
+    void 'we can read crumbs'() {
+        given:
+        String jenkinsCrumbResponse = '<hudson><crumb>fb171d526b9cc9e25afe80b356e12cb7</crumb><crumbRequestField>.crumb</crumbRequestField></hudson>"}'
+
+        MockWebServer server = new MockWebServer()
+        server.enqueue(
+            new MockResponse()
+                .setBody(jenkinsCrumbResponse)
+                .setHeader('Content-Type', 'text/xml;charset=UTF-8')
+        )
+        server.start()
+        client = Mock(JenkinsClient)
+
+        def host = new JenkinsProperties.JenkinsHost(
+            address: server.url('/').toString(),
+            username: 'username',
+            password: 'password')
+        client = new JenkinsConfig().jenkinsClient(host)
+        service = new JenkinsService('http://my.jenkins.net', client, true, Permissions.EMPTY)
+
+        when:
+        String crumb = service.getCrumb()
+
+        then:
+        crumb == "fb171d526b9cc9e25afe80b356e12cb7"
+
+        cleanup:
+        server.shutdown()
+    }
+
     void 'get a list of projects with the folders plugin'() {
         given:
+        MockWebServer server = new MockWebServer()
+        server.enqueue(
+            new MockResponse()
+                .setBody(getProjects())
+                .setHeader('Content-Type', 'text/xml;charset=UTF-8')
+        )
+        server.start()
         def host = new JenkinsProperties.JenkinsHost(
             address: server.getUrl('/').toString(),
             username: 'username',
             password: 'password')
         client = new JenkinsConfig().jenkinsClient(host)
-        service = new JenkinsService('http://my.jenkins.net', client, false)
+        service = new JenkinsService('http://my.jenkins.net', client, false, Permissions.EMPTY)
 
         when:
         List<Project> projects = service.projects.list
@@ -156,6 +192,9 @@ class JenkinsServiceSpec extends Specification {
         then:
         projects.size() == 3
         projects*.name == ['job1', 'job2', 'folder1/job/folder2/job/job3']
+
+        cleanup:
+        server.shutdown()
     }
 
     private String getProjects() {
@@ -239,7 +278,7 @@ class JenkinsServiceSpec extends Specification {
             username: 'username',
             password: 'password')
         client = new JenkinsConfig().jenkinsClient(host)
-        service = new JenkinsService('http://my.jenkins.net', client, false)
+        service = new JenkinsService('http://my.jenkins.net', client, false, Permissions.EMPTY)
 
         when:
         List<GenericGitRevision> genericGitRevision = service.getGenericGitRevisions('test', 1)
@@ -292,7 +331,7 @@ class JenkinsServiceSpec extends Specification {
             username: 'username',
             password: 'password')
         client = new JenkinsConfig().jenkinsClient(host)
-        service = new JenkinsService('http://my.jenkins.net', client, false)
+        service = new JenkinsService('http://my.jenkins.net', client, false, Permissions.EMPTY)
 
         when:
         List<GenericGitRevision> genericGitRevision = service.getGenericGitRevisions('test', 1)
@@ -312,4 +351,321 @@ class JenkinsServiceSpec extends Specification {
         cleanup:
         server.shutdown()
     }
+
+    void "when Jenkins returns a single scm in BuildDetails, our JenkinsService will return a single scm"() {
+        given:
+        String jenkinsSCMResponse = String.join("\n",
+            '<freeStyleBuild _class="hudson.model.FreeStyleBuild">',
+            '  <action _class=\"hudson.plugins.git.util.BuildDetails\">',
+            '    <build>',
+            '      <revision>',
+            '        <branch>',
+            '          <SHA1>111aaa</SHA1>',
+            '          <name>refs/remotes/origin/master</name>',
+            '        </branch>',
+            '      </revision>',
+            '    </build>',
+            '    <remoteUrl>https://github.com/spinnaker/igor</remoteUrl>',
+            '  </action>',
+            '</freeStyleBuild>',
+        )
+
+        MockWebServer server = new MockWebServer()
+        server.enqueue(
+            new MockResponse()
+                .setBody(jenkinsSCMResponse)
+                .setHeader('Content-Type', 'text/xml;charset=UTF-8')
+        )
+        server.start()
+        client = Mock(JenkinsClient)
+
+        def host = new JenkinsProperties.JenkinsHost(
+            address: server.url('/').toString(),
+            username: 'username',
+            password: 'password')
+        client = new JenkinsConfig().jenkinsClient(host)
+        service = new JenkinsService('http://my.jenkins.net', client, false, Permissions.EMPTY)
+
+        when:
+        List<GenericGitRevision> genericGitRevision = service.getGenericGitRevisions('test', 1)
+
+        then:
+        genericGitRevision.size() == 1
+        genericGitRevision.get(0).name == "refs/remotes/origin/master"
+        genericGitRevision.get(0).branch == "master"
+        genericGitRevision.get(0).sha1 == "111aaa"
+        genericGitRevision.get(0).remoteUrl == "https://github.com/spinnaker/igor"
+
+        cleanup:
+        server.shutdown()
+    }
+
+    void "when Jenkins returns multiple scms in BuildDetails, our JenkinsService will return multiple scms"() {
+        given:
+        String jenkinsSCMResponse = String.join("\n",
+            '<freeStyleBuild _class="hudson.model.FreeStyleBuild">',
+            '  <action _class=\"hudson.plugins.git.util.BuildDetails\">',
+            '    <build>',
+            '      <revision>',
+            '        <branch>',
+            '          <SHA1>111aaa</SHA1>',
+            '          <name>refs/remotes/origin/master</name>',
+            '        </branch>',
+            '      </revision>',
+            '    </build>',
+            '    <remoteUrl>https://github.com/spinnaker/igor</remoteUrl>',
+            '  </action>',
+            '  <action _class=\"hudson.plugins.git.util.BuildData\">',
+            '    <build>',
+            '      <revision>',
+            '        <branch>',
+            '          <SHA1>222bbb</SHA1>',
+            '          <name>refs/remotes/origin/master-master</name>',
+            '        </branch>',
+            '      </revision>',
+            '    </build>',
+            '    <remoteUrl>https://github.com/spinnaker/igor-fork</remoteUrl>',
+            '  </action>',
+            '</freeStyleBuild>',
+        )
+
+        MockWebServer server = new MockWebServer()
+        server.enqueue(
+            new MockResponse()
+                .setBody(jenkinsSCMResponse)
+                .setHeader('Content-Type', 'text/xml;charset=UTF-8')
+        )
+        server.start()
+        client = Mock(JenkinsClient)
+
+        def host = new JenkinsProperties.JenkinsHost(
+            address: server.url('/').toString(),
+            username: 'username',
+            password: 'password')
+        client = new JenkinsConfig().jenkinsClient(host)
+        service = new JenkinsService('http://my.jenkins.net', client, false, Permissions.EMPTY)
+
+        when:
+        List<GenericGitRevision> genericGitRevision = service.getGenericGitRevisions('test', 1)
+
+        then:
+        genericGitRevision.size() == 2
+        genericGitRevision.get(0).name == "refs/remotes/origin/master"
+        genericGitRevision.get(0).branch == "master"
+        genericGitRevision.get(0).sha1 == "111aaa"
+        genericGitRevision.get(0).remoteUrl == "https://github.com/spinnaker/igor"
+
+        genericGitRevision.get(1).name == "refs/remotes/origin/master-master"
+        genericGitRevision.get(1).branch == "master-master"
+        genericGitRevision.get(1).sha1 == "222bbb"
+        genericGitRevision.get(1).remoteUrl == "https://github.com/spinnaker/igor-fork"
+
+        cleanup:
+        server.shutdown()
+    }
+
+    void "when Jenkins returns different scms in BuildData and BuildDetails, both are returned"() {
+        given:
+        String jenkinsSCMResponse = String.join("\n",
+            '<freeStyleBuild _class="hudson.model.FreeStyleBuild">',
+            '  <action _class=\"hudson.plugins.git.util.BuildData\">',
+            '    <lastBuiltRevision>',
+            '      <branch>',
+            '        <SHA1>111aaa</SHA1>',
+            '        <name>refs/remotes/origin/master</name>',
+            '      </branch>',
+            '    </lastBuiltRevision>',
+            '    <remoteUrl>https://github.com/spinnaker/igor</remoteUrl>',
+            '  </action>',
+            '  <action _class=\"hudson.plugins.git.util.BuildData\">',
+            '    <build>',
+            '      <revision>',
+            '        <branch>',
+            '          <SHA1>222bbb</SHA1>',
+            '          <name>refs/remotes/origin/master-master</name>',
+            '        </branch>',
+            '      </revision>',
+            '    </build>',
+            '    <remoteUrl>https://github.com/spinnaker/igor-fork</remoteUrl>',
+            '  </action>',
+            '</freeStyleBuild>',
+        )
+
+        MockWebServer server = new MockWebServer()
+        server.enqueue(
+            new MockResponse()
+                .setBody(jenkinsSCMResponse)
+                .setHeader('Content-Type', 'text/xml;charset=UTF-8')
+        )
+        server.start()
+        client = Mock(JenkinsClient)
+
+        def host = new JenkinsProperties.JenkinsHost(
+            address: server.url('/').toString(),
+            username: 'username',
+            password: 'password')
+        client = new JenkinsConfig().jenkinsClient(host)
+        service = new JenkinsService('http://my.jenkins.net', client, false, Permissions.EMPTY)
+
+        when:
+        List<GenericGitRevision> genericGitRevision = service.getGenericGitRevisions('test', 1)
+
+        then:
+        genericGitRevision.size() == 2
+        genericGitRevision.get(0).name == "refs/remotes/origin/master"
+        genericGitRevision.get(0).branch == "master"
+        genericGitRevision.get(0).sha1 == "111aaa"
+        genericGitRevision.get(0).remoteUrl == "https://github.com/spinnaker/igor"
+
+        genericGitRevision.get(1).name == "refs/remotes/origin/master-master"
+        genericGitRevision.get(1).branch == "master-master"
+        genericGitRevision.get(1).sha1 == "222bbb"
+        genericGitRevision.get(1).remoteUrl == "https://github.com/spinnaker/igor-fork"
+
+        cleanup:
+        server.shutdown()
+    }
+
+    void "when Jenkins the same scm in BuildData and BuildDetails, it is returned only once"() {
+        given:
+        String jenkinsSCMResponse = String.join("\n",
+            '<freeStyleBuild _class="hudson.model.FreeStyleBuild">',
+            '  <action _class=\"hudson.plugins.git.util.BuildData\">',
+            '    <lastBuiltRevision>',
+            '      <branch>',
+            '        <SHA1>111aaa</SHA1>',
+            '        <name>refs/remotes/origin/master</name>',
+            '      </branch>',
+            '    </lastBuiltRevision>',
+            '    <remoteUrl>https://github.com/spinnaker/igor</remoteUrl>',
+            '  </action>',
+            '  <action _class=\"hudson.plugins.git.util.BuildData\">',
+            '    <build>',
+            '      <revision>',
+            '        <branch>',
+            '          <SHA1>111aaa</SHA1>',
+            '          <name>refs/remotes/origin/master</name>',
+            '        </branch>',
+            '      </revision>',
+            '    </build>',
+            '    <remoteUrl>https://github.com/spinnaker/igor</remoteUrl>',
+            '  </action>',
+            '</freeStyleBuild>',
+        )
+
+        MockWebServer server = new MockWebServer()
+        server.enqueue(
+            new MockResponse()
+                .setBody(jenkinsSCMResponse)
+                .setHeader('Content-Type', 'text/xml;charset=UTF-8')
+        )
+        server.start()
+        client = Mock(JenkinsClient)
+
+        def host = new JenkinsProperties.JenkinsHost(
+            address: server.url('/').toString(),
+            username: 'username',
+            password: 'password')
+        client = new JenkinsConfig().jenkinsClient(host)
+        service = new JenkinsService('http://my.jenkins.net', client, false, Permissions.EMPTY)
+
+        when:
+        List<GenericGitRevision> genericGitRevision = service.getGenericGitRevisions('test', 1)
+
+        then:
+        genericGitRevision.size() == 1
+        genericGitRevision.get(0).name == "refs/remotes/origin/master"
+        genericGitRevision.get(0).branch == "master"
+        genericGitRevision.get(0).sha1 == "111aaa"
+        genericGitRevision.get(0).remoteUrl == "https://github.com/spinnaker/igor"
+
+        cleanup:
+        server.shutdown()
+    }
+
+    @Unroll
+    def "getProperties correctly deserializes properties}"() {
+        given:
+        def extension = testCase.extension
+        String buildData = String.join("\n",
+            '<freeStyleBuild _class="hudson.model.FreeStyleBuild">',
+                '<artifact>',
+                    "<displayPath>props$extension</displayPath>",
+                    "<fileName>props$extension</fileName>",
+                    "<relativePath>properties/props$extension</relativePath>",
+                '</artifact>',
+                '<building>false</building>',
+                '<duration>341</duration>',
+                '<fullDisplayName>PropertiesTest #5</fullDisplayName>',
+                '<number>5</number>',
+                '<result>SUCCESS</result>',
+                '<timestamp>1551546969642</timestamp>',
+                '<url>http://jenkins-host.test/job/PropertiesTest/5/</url>',
+            '</freeStyleBuild>')
+        MockWebServer server = new MockWebServer()
+        server.enqueue(
+            new MockResponse()
+                .setBody(buildData)
+                .setHeader('Content-Type', "application/xml")
+        )
+        server.enqueue(
+            new MockResponse()
+                .setBody(testCase.contents)
+                .setHeader('Content-Type', "application/octet-stream")
+        )
+        server.start()
+        def host = new JenkinsProperties.JenkinsHost(
+            address: server.url('/').toString(),
+            username: 'username',
+            password: 'password')
+        client = new JenkinsConfig().jenkinsClient(host)
+        service = new JenkinsService('http://my.jenkins.net', client, false, Permissions.EMPTY)
+
+        expect:
+        service.getBuildProperties("PropertiesTest", 1, "props$extension") == testCase.result
+
+        cleanup:
+        server.shutdown()
+
+        where:
+        testCase << [
+            [
+                extension: "",
+                contents: '''
+                    a=hello
+                    b=world
+                    c=3
+                ''',
+                result: [a: "hello", b: "world", c: "3"],
+            ],
+            [
+                extension: ".json",
+                contents: '''
+                    {
+                        "a" : "hello",
+                        "b" : "world",
+                        "c" : 3,
+                        "nested" : {
+                            "list" : [1, "a"]
+                        }
+                    }
+                ''',
+                result: [a: "hello", b: "world", c: 3, nested: [list: [1, "a"]] ],
+            ],
+            [
+                extension: ".yml",
+                contents: '''
+                    a: hello
+                    b: world
+                    c: 3
+                    nested:
+                        list:
+                            - 1
+                            - a
+                ''',
+                result: [a: "hello", b: "world", c: 3, nested: [list: [1, "a"]] ],
+            ],
+        ]
+    }
+
 }

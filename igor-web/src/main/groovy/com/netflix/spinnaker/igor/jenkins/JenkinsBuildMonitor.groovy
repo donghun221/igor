@@ -17,6 +17,7 @@
 package com.netflix.spinnaker.igor.jenkins
 
 import com.netflix.discovery.DiscoveryClient
+import com.netflix.spectator.api.BasicTag
 import com.netflix.spectator.api.Registry
 import com.netflix.spinnaker.igor.IgorConfigurationProperties
 import com.netflix.spinnaker.igor.config.JenkinsProperties
@@ -32,7 +33,7 @@ import com.netflix.spinnaker.igor.polling.DeltaItem
 import com.netflix.spinnaker.igor.polling.LockService
 import com.netflix.spinnaker.igor.polling.PollContext
 import com.netflix.spinnaker.igor.polling.PollingDelta
-import com.netflix.spinnaker.igor.service.BuildMasters
+import com.netflix.spinnaker.igor.service.BuildServices
 import groovy.time.TimeCategory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.beans.factory.annotation.Value
@@ -51,7 +52,7 @@ import static net.logstash.logback.argument.StructuredArguments.kv
 class JenkinsBuildMonitor extends CommonPollingMonitor<JobDelta, JobPollingDelta> {
 
     private final JenkinsCache cache
-    private final BuildMasters buildMasters
+    private final BuildServices buildServices
     private final boolean pollingEnabled
     private final Optional<EchoService> echoService
     private final JenkinsProperties jenkinsProperties
@@ -62,13 +63,13 @@ class JenkinsBuildMonitor extends CommonPollingMonitor<JobDelta, JobPollingDelta
                         Optional<DiscoveryClient> discoveryClient,
                         Optional<LockService> lockService,
                         JenkinsCache cache,
-                        BuildMasters buildMasters,
+                        BuildServices buildServices,
                         @Value('${jenkins.polling.enabled:true}') boolean pollingEnabled,
                         Optional<EchoService> echoService,
                         JenkinsProperties jenkinsProperties) {
         super(properties, registry, discoveryClient, lockService)
         this.cache = cache
-        this.buildMasters = buildMasters
+        this.buildServices = buildServices
         this.pollingEnabled = pollingEnabled
         this.echoService = echoService
         this.jenkinsProperties = jenkinsProperties
@@ -90,12 +91,9 @@ class JenkinsBuildMonitor extends CommonPollingMonitor<JobDelta, JobPollingDelta
 
     @Override
     void poll(boolean sendEvents) {
-        long startTime = System.currentTimeMillis()
-        log.info "Polling cycle started: ${new Date()}"
-        buildMasters.filteredMap(BuildServiceProvider.JENKINS).keySet().stream().forEach(
+        buildServices.getServiceNames(BuildServiceProvider.JENKINS).stream().forEach(
             { master -> pollSingle(new PollContext(master, !sendEvents)) }
         )
-        log.info "Polling cycle done in ${System.currentTimeMillis() - startTime}ms"
     }
 
     /**
@@ -105,21 +103,20 @@ class JenkinsBuildMonitor extends CommonPollingMonitor<JobDelta, JobPollingDelta
     @Override
     protected JobPollingDelta generateDelta(PollContext ctx) {
         String master = ctx.partitionName
-        log.debug("Checking for new builds for $master")
-        def startTime = System.currentTimeMillis()
+        log.trace("Checking for new builds for $master")
 
-        List<JobDelta> delta = []
-
-        JenkinsService jenkinsService = buildMasters.map[master] as JenkinsService
-        List<Project> jobs = jenkinsService.getProjects()?.getList() ?:[]
-        jobs.forEach( { job -> processBuildsOfProject(jenkinsService, master, job, delta)})
-        log.debug("Took ${System.currentTimeMillis() - startTime}ms to retrieve projects (master: {})", kv("master", master))
+        final List<JobDelta> delta = []
+        registry.timer("pollingMonitor.jenkins.retrieveProjects", [new BasicTag("partition", master)]).record {
+            JenkinsService jenkinsService = buildServices.getService(master) as JenkinsService
+            List<Project> jobs = jenkinsService.getProjects()?.getList() ?:[]
+            jobs.forEach( { job -> processBuildsOfProject(jenkinsService, master, job, delta)})
+        }
         return new JobPollingDelta(master: master, items: delta)
     }
 
     private void processBuildsOfProject(JenkinsService jenkinsService, String master, Project job, List<JobDelta> delta) {
         if (!job.lastBuild) {
-            log.debug("[{}:{}] has no builds skipping...", kv("master", master), kv("job", job.name))
+            log.trace("[{}:{}] has no builds skipping...", kv("master", master), kv("job", job.name))
             return
         }
 
@@ -128,7 +125,7 @@ class JenkinsBuildMonitor extends CommonPollingMonitor<JobDelta, JobPollingDelta
             Long lastBuildStamp = job.lastBuild.timestamp as Long
             Date upperBound = new Date(lastBuildStamp)
             if (cursor == lastBuildStamp) {
-                log.debug("[${master}:${job.name}] is up to date. skipping")
+                log.trace("[${master}:${job.name}] is up to date. skipping")
                 return
             }
 
@@ -169,11 +166,11 @@ class JenkinsBuildMonitor extends CommonPollingMonitor<JobDelta, JobPollingDelta
     private List<Build> getBuilds(JenkinsService jenkinsService, String master, Project job, Long cursor, Long lastBuildStamp) {
         if (!cursor) {
             log.debug("[${master}:${job.name}] setting new cursor to ${lastBuildStamp}")
-            return jenkinsService.getBuilds(job.name).getList() ?: []
+            return jenkinsService.getBuilds(job.name) ?: []
         }
 
         // filter between last poll and jenkins last build included
-        return (jenkinsService.getBuilds(job.name).getList() ?: []).findAll { build ->
+        return (jenkinsService.getBuilds(job.name) ?: []).findAll { build ->
             Long buildStamp = build.timestamp as Long
             return buildStamp <= lastBuildStamp && buildStamp > cursor
         }

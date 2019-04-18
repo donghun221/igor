@@ -16,23 +16,26 @@
 
 package com.netflix.spinnaker.igor.config
 
+import com.netflix.spinnaker.fiat.model.resources.Permissions
 import groovy.transform.CompileStatic
 import org.hibernate.validator.constraints.NotEmpty
 import org.springframework.boot.context.properties.ConfigurationProperties
 import org.springframework.validation.annotation.Validated
 
 import javax.validation.Valid
+import java.security.KeyStore
+
 /**
  * Helper class to map masters in properties file into a validated property map
  */
 @CompileStatic
 @ConfigurationProperties(prefix = 'jenkins')
 @Validated
-class JenkinsProperties {
+class JenkinsProperties implements BuildServerProperties<JenkinsProperties.JenkinsHost> {
     @Valid
     List<JenkinsHost> masters
 
-    static class JenkinsHost {
+    static class JenkinsHost implements BuildServerProperties.Host {
         @NotEmpty
         String name
 
@@ -53,5 +56,13 @@ class JenkinsProperties {
         String token
 
         Integer itemUpperThreshold;
+
+        String trustStore
+        String trustStoreType = KeyStore.getDefaultType()
+        String trustStorePassword
+
+        Boolean skipHostnameVerification = false
+
+        Permissions.Builder permissions = new Permissions.Builder()
     }
 }

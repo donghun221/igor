@@ -17,13 +17,16 @@
 
 package com.netflix.spinnaker.igor.travis.service;
 
+import com.netflix.spinnaker.fiat.model.resources.Permissions;
 import com.netflix.spinnaker.hystrix.SimpleJava8HystrixCommand;
 import com.netflix.spinnaker.igor.build.model.GenericBuild;
 import com.netflix.spinnaker.igor.build.model.GenericGitRevision;
 import com.netflix.spinnaker.igor.build.model.GenericJobConfiguration;
+import com.netflix.spinnaker.igor.build.model.Result;
 import com.netflix.spinnaker.igor.model.BuildServiceProvider;
 import com.netflix.spinnaker.igor.service.ArtifactDecorator;
-import com.netflix.spinnaker.igor.service.BuildService;
+import com.netflix.spinnaker.igor.service.BuildOperations;
+import com.netflix.spinnaker.igor.service.BuildProperties;
 import com.netflix.spinnaker.igor.travis.TravisCache;
 import com.netflix.spinnaker.igor.travis.client.TravisClient;
 import com.netflix.spinnaker.igor.travis.client.logparser.ArtifactParser;
@@ -52,11 +55,7 @@ import net.logstash.logback.argument.StructuredArguments;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import retrofit.RetrofitError;
-import retrofit.client.Response;
-import retrofit.mime.TypedByteArray;
 
-import javax.annotation.Nullable;
-import java.io.IOException;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
@@ -66,10 +65,13 @@ import java.util.List;
 import java.util.Map;
 import java.util.NoSuchElementException;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 
-public class TravisService implements BuildService {
+import static net.logstash.logback.argument.StructuredArguments.kv;
+
+public class TravisService implements BuildOperations, BuildProperties {
 
     private static final int TRAVIS_BUILD_RESULT_LIMIT = 25;
 
@@ -81,11 +83,16 @@ public class TravisService implements BuildService {
     private final TravisClient travisClient;
     private final TravisCache travisCache;
     private final Collection<String> artifactRegexes;
-    private final ArtifactDecorator artifactDecorator;
+    private final Optional<ArtifactDecorator> artifactDecorator;
+    private final String buildMessageKey;
+    private final Permissions permissions;
     protected AccessToken accessToken;
     private Accounts accounts;
 
-    public TravisService(String travisHostId, String baseUrl, String githubToken, int numberOfRepositories, TravisClient travisClient, TravisCache travisCache, @Nullable ArtifactDecorator artifactDecorator, Collection<String> artifactRegexes) {
+    public TravisService(String travisHostId, String baseUrl, String githubToken, int numberOfRepositories,
+                         TravisClient travisClient, TravisCache travisCache,
+                         Optional<ArtifactDecorator> artifactDecorator, Collection<String> artifactRegexes,
+                         String buildMessageKey, Permissions permissions) {
         this.numberOfRepositories = numberOfRepositories;
         this.groupKey = travisHostId;
         this.gitHubAuth = new GithubAuth(githubToken);
@@ -94,10 +101,17 @@ public class TravisService implements BuildService {
         this.travisCache = travisCache;
         this.artifactDecorator = artifactDecorator;
         this.artifactRegexes = artifactRegexes != null ? new HashSet<>(artifactRegexes) : Collections.emptySet();
+        this.buildMessageKey = buildMessageKey;
+        this.permissions = permissions;
     }
 
     @Override
-    public BuildServiceProvider buildServiceProvider() {
+    public String getName() {
+        return this.groupKey;
+    }
+
+    @Override
+    public BuildServiceProvider getBuildServiceProvider() {
         return BuildServiceProvider.TRAVIS;
     }
 
@@ -122,7 +136,7 @@ public class TravisService implements BuildService {
         return new SimpleJava8HystrixCommand<>(groupKey, buildCommandKey("getGenericBuild"), () -> {
             String repoSlug = cleanRepoSlug(inputRepoSlug);
             Build build = getBuild(repoSlug, buildNumber);
-            return getGenericBuild(build, repoSlug, true);
+            return getGenericBuild(build, repoSlug);
         }).execute();
     }
 
@@ -131,6 +145,11 @@ public class TravisService implements BuildService {
         String repoSlug = cleanRepoSlug(inputRepoSlug);
         String branch = branchFromRepoSlug(inputRepoSlug);
         RepoRequest repoRequest = new RepoRequest(branch.isEmpty() ? "master" : branch);
+        if (buildMessageKey != null && queryParameters.containsKey(buildMessageKey)) {
+            String buildMessage = queryParameters.get(buildMessageKey);
+            queryParameters.remove(buildMessageKey);
+            repoRequest.setMessage(repoRequest.getMessage() + ": " + buildMessage);
+        }
         repoRequest.setConfig(new Config(queryParameters));
         final TriggerResponse triggerResponse = travisClient.triggerBuild(getAccessToken(), repoSlug, repoRequest);
         if (triggerResponse.getRemainingRequests() > 0) {
@@ -139,6 +158,11 @@ public class TravisService implements BuildService {
         }
 
         return travisCache.setQueuedJob(groupKey, triggerResponse.getRequest().getRepository().getId(), triggerResponse.getRequest().getId());
+    }
+
+    @Override
+    public Permissions getPermissions() {
+        return permissions;
     }
 
     public List<Build> getBuilds() {
@@ -158,7 +182,7 @@ public class TravisService implements BuildService {
     }
 
     public Builds getBuilds(String repoSlug, int buildNumber) {
-        return new SimpleJava8HystrixCommand<>(groupKey, buildCommandKey("getBuilds"), () ->
+        return new SimpleJava8HystrixCommand<>(groupKey, buildCommandKey("getBuildList"), () ->
             travisClient.builds(getAccessToken(), repoSlug, buildNumber)).execute();
     }
 
@@ -167,11 +191,16 @@ public class TravisService implements BuildService {
         return !builds.getBuilds().isEmpty() ? builds.getBuilds().get(0) : null;
     }
 
-    public Map<String, Object> getBuildProperties(String inputRepoSlug, int buildNumber) throws IOException {
-        String repoSlug = cleanRepoSlug(inputRepoSlug);
-
-        Build build = getBuild(repoSlug, buildNumber);
-        return PropertyParser.extractPropertiesFromLog(getLog(build));
+    @Override
+    public Map<String, Object> getBuildProperties(String inputRepoSlug, int buildNumber, String fileName) {
+        try {
+            String repoSlug = cleanRepoSlug(inputRepoSlug);
+            Build build = getBuild(repoSlug, buildNumber);
+            return PropertyParser.extractPropertiesFromLog(getLog(build));
+        } catch (Exception e) {
+            log.error("Unable to get igorProperties '{}'", kv("job", inputRepoSlug), e);
+            return Collections.emptyMap();
+        }
     }
 
     public List<Build> getBuilds(Repo repo) {
@@ -196,6 +225,7 @@ public class TravisService implements BuildService {
             .collect(Collectors.toList());
     }
 
+    @Override
     public List<GenericBuild> getBuilds(String inputRepoSlug) {
         String repoSlug = cleanRepoSlug(inputRepoSlug);
         String branch = branchFromRepoSlug(inputRepoSlug);
@@ -245,7 +275,8 @@ public class TravisService implements BuildService {
 
     public Job getJob(int jobId) {
         log.debug("fetching job for {}", jobId);
-        Jobs jobs = travisClient.jobs(getAccessToken(), jobId);
+        Jobs jobs = new SimpleJava8HystrixCommand<>(groupKey, buildCommandKey("getJob"), () ->
+            travisClient.jobs(getAccessToken(), jobId)).execute();
         return jobs.getJob();
     }
 
@@ -254,37 +285,55 @@ public class TravisService implements BuildService {
         if (jobIds == null) {
             return "";
         }
-        return jobIds.stream()
-            .map(this::getJob)
-            .map(job -> {
-                if (job.getLogId() > 0) {
-                    return getLog(job.getLogId());
-                } else {
-                    V3Log log = getJobLog(job.getId());
-                    return log == null ? "" : log.getContent();
-                }
-            })
+        String travisLog = jobIds.stream()
+            .map(this::getJobLog)
+            .filter(Objects::nonNull)
             .collect(Collectors.joining("\n"));
+        log.info("fetched logs for [buildNumber:{}], [buildId:{}], [logLength:{}]", build.getNumber(), build.getId(), travisLog.length());
+        return travisLog;
     }
 
     public String getLog(V3Build build) {
-        return build.getJobs().stream()
+        String travisLog = build.getJobs().stream()
             .map(V3Job::getId)
             .map(this::getJobLog)
             .filter(Objects::nonNull)
-            .map(V3Log::getContent)
             .collect(Collectors.joining("\n"));
+        log.info("fetched logs for [buildNumber:{}], [buildId:{}], [logLength:{}]", build.getNumber(), build.getId(), travisLog.length());
+        return travisLog;
     }
 
-    public String getLog(int logId) {
-        log.debug("fetching log by logId {}", logId);
-        Response response = travisClient.log(getAccessToken(), logId);
-        return new String(((TypedByteArray) response.getBody()).getBytes());
+    public boolean isLogReady(List<Integer> jobIds) {
+        return jobIds.stream()
+            .map(this::getAndCacheJobLog)
+            .allMatch(Optional::isPresent);
     }
 
-    public V3Log getJobLog(int jobId) {
+    private Optional<String> getAndCacheJobLog(int jobId) {
         log.debug("fetching log by jobId {}", jobId);
-        return travisClient.jobLog(getAccessToken(), jobId);
+        String cachedLog = travisCache.getJobLog(groupKey, jobId);
+        if (cachedLog != null) {
+            log.info("Found log for jobId {} in the cache", jobId);
+            return Optional.of(cachedLog);
+        }
+        V3Log v3Log = new SimpleJava8HystrixCommand<>(groupKey, buildCommandKey("getJobLog"), () ->
+            travisClient.jobLog(getAccessToken(), jobId)).execute();
+        if (v3Log != null && v3Log.isReady()) {
+            log.info("Log for jobId {} was ready, caching it", jobId);
+            travisCache.setJobLog(groupKey, jobId, v3Log.getContent());
+            return Optional.of(v3Log.getContent());
+        }
+        return Optional.empty();
+    }
+
+    public String getJobLog(int jobId) {
+        Optional<String> jobLog = getAndCacheJobLog(jobId);
+        if (jobLog.isPresent()) {
+            return jobLog.get();
+        } else {
+            log.warn("Incomplete log for jobId {}! This is not supposed to happen.", jobId);
+            return null;
+        }
     }
 
     public Repo getRepo(int repositoryId) {
@@ -296,13 +345,12 @@ public class TravisService implements BuildService {
     }
 
     public GenericBuild getGenericBuild(Build build, String repoSlug) {
-        return getGenericBuild(build, repoSlug, false);
-    }
-
-    public GenericBuild getGenericBuild(Build build, String repoSlug, boolean fetchLogs) {
         GenericBuild genericBuild = TravisBuildConverter.genericBuild(build, repoSlug, baseUrl);
-        if (fetchLogs) {
+        boolean logReady = isLogReady(build.getJob_ids());
+        if (logReady) {
             parseAndDecorateArtifacts(getLog(build), genericBuild);
+        } else {
+            genericBuild.setResult(Result.BUILDING);
         }
         return genericBuild;
     }
@@ -335,7 +383,7 @@ public class TravisService implements BuildService {
         Request requestResponse = travisClient.request(getAccessToken(), queuedJob.get("repositoryId"), queuedJob.get("requestId"));
         if (!requestResponse.getBuilds().isEmpty()) {
             log.info("{}: Build found: [{}:{}] . Removing {} from {} travisCache.", StructuredArguments.kv("group", groupKey), requestResponse.getRepository().getSlug(), requestResponse.getBuilds().get(0).getNumber(), queueId, groupKey);
-            travisCache.remove(groupKey, queueId);
+            travisCache.removeQuededJob(groupKey, queueId);
             LinkedHashMap<String, Integer> map = new LinkedHashMap<>(1);
             map.put("number", requestResponse.getBuilds().get(0).getNumber());
             return map;
@@ -471,10 +519,7 @@ public class TravisService implements BuildService {
 
     private void parseAndDecorateArtifacts(String log, GenericBuild genericBuild) {
         genericBuild.setArtifacts(ArtifactParser.getArtifactsFromLog(log, artifactRegexes));
-        if (artifactDecorator != null) {
-            artifactDecorator.decorate(genericBuild);
-        }
-
+        artifactDecorator.ifPresent(decorator -> decorator.decorate(genericBuild));
     }
 
     public final String getBaseUrl() {
